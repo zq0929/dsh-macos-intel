@@ -35,12 +35,10 @@ on:
         type: boolean
         default: false
   schedule:
-    # 02:17 Beijing (18:17 UTC), off the hour because scheduled runs queue up then.
-    # GitHub's scheduler can run late or drop a tick under load, so ask three times;
-    # the sync step makes a repeat run a no-op.
-    - cron: '17 18 * * *'
-    - cron: '37 18 * * *'
-    - cron: '57 18 * * *'
+    # The real timetable is the Cloudflare Worker (cron 17 18 * * *), because GitHub's
+    # own scheduler ran late or dropped ticks in testing. This single later tick is a
+    # fallback if that Worker ever goes away; a repeat run is a no-op in the sync step.
+    - cron: '47 18 * * *'
 
 # The sync job merges upstream into master, and a release needs write access.
 permissions:
