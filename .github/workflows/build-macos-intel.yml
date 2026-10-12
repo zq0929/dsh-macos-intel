@@ -100,17 +100,6 @@ jobs:
           echo "head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "tree replaced with upstream $(printf %.7s "$UPSTREAM_SHA")"
 
-      - name: Keep only this workflow enabled
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # Leftovers from before the snapshot design; the tree no longer ships them.
-          for ID in $(gh api "repos/$GITHUB_REPOSITORY/actions/workflows?per_page=100" \
-                        --jq '.workflows[] | select(.name != "Build macOS Intel (x86_64)") | .id'); do
-            gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/$ID/disable" >/dev/null \
-              && echo "disabled workflow $ID"
-          done
-
   build:
     name: Build macOS Intel (x86_64)
     needs: sync
