@@ -36,7 +36,7 @@ on:
         default: false
   schedule:
     # 02:17 Beijing (18:17 UTC), off the hour because scheduled runs queue up then.
-    - cron: '*/5 * * * *'   # TEMPORARY schedule probe; restored once verified
+    - cron: '17 18 * * *'
 
 # The sync job merges upstream into master, and a release needs write access.
 permissions:
@@ -91,6 +91,20 @@ jobs:
             echo "upstream merged into master"
           fi
           echo "head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Keep only this workflow enabled
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # The tree mirrors upstream, so upstream's own workflow files are present here.
+          # GitHub can register them when a sync touches them; none of them should run.
+          for ID in $(gh api "repos/$GITHUB_REPOSITORY/actions/workflows?per_page=100" \
+                        --jq '.workflows[] | select(.name != "Build macOS Intel (x86_64)") | .id'); do
+            gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/$ID/disable" >/dev/null \
+              && echo "disabled workflow $ID"
+          done
+          gh api "repos/$GITHUB_REPOSITORY/actions/workflows?per_page=100" \
+            --jq '.workflows[] | select(.state == "active") | "active: " + .name'
 
   build:
     name: Build macOS Intel (x86_64)
