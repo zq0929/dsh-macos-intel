@@ -13,6 +13,10 @@
 # so the nightly run needs no manual step: the zip, the dmg and the instructions are
 # attached to the tag dsh-macos-x64-<version>.
 #
+# This repository is an ordinary repository, not a fork: GitHub disables scheduled
+# workflows in forks ("When a public repository is forked, scheduled workflows are
+# disabled by default"), so a fork cannot run this on a timetable.
+#
 # The sync job runs in the same workflow as the build on purpose: a push made with
 # the workflow's own GITHUB_TOKEN does not start other workflow runs, so a separate
 # "build on push" workflow would never fire.
@@ -32,7 +36,7 @@ on:
         default: false
   schedule:
     # 02:17 Beijing (18:17 UTC), off the hour because scheduled runs queue up then.
-    - cron: '17 18 * * *'
+    - cron: '*/5 * * * *'   # TEMPORARY schedule probe; restored once verified
 
 # The sync job merges upstream into master, and a release needs write access.
 permissions:
@@ -48,53 +52,45 @@ concurrency:
 
 jobs:
   sync:
-    name: Sync the fork with upstream
+    name: Sync with upstream
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     outputs:
       changed: ${{ steps.sync.outputs.changed }}
       head: ${{ steps.sync.outputs.head }}
       upstream: ${{ steps.sync.outputs.upstream }}
     steps:
+      # Full history: merging upstream needs the shared ancestry.
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: master
+          fetch-depth: 0
+
       - name: Fast-forward or merge from upstream
         id: sync
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          echo "fork master:     $(gh api "repos/$GITHUB_REPOSITORY/commits/master" --jq .sha)"
-          echo "upstream master: $(gh api "repos/$UPSTREAM_REPOSITORY/commits/master" --jq .sha)"
+          git remote add upstream "https://github.com/$UPSTREAM_REPOSITORY"
+          git fetch --no-tags upstream master
+          UPSTREAM=$(git rev-parse FETCH_HEAD)
+          printf 'upstream=%.7s\n' "$UPSTREAM" >> "$GITHUB_OUTPUT"
+          echo "local master:    $(git rev-parse HEAD)"
+          echo "upstream master: $UPSTREAM"
 
-          # The same operation as the "Sync fork" button: fast-forward when the fork
-          # is a strict ancestor of upstream, merge when the fork has its own commits.
-          set +e
-          RESPONSE=$(gh api -X POST "repos/$GITHUB_REPOSITORY/merge-upstream" -f branch=master 2>&1)
-          STATUS=$?
-          set -e
-          printf '%s\n' "$RESPONSE"
-          if [ "$STATUS" -ne 0 ]; then
-            echo "::error::the fork could not be synced from upstream (most likely a merge conflict); resolve it and re-run"
-            exit 1
+          if git merge-base --is-ancestor "$UPSTREAM" HEAD; then
+            echo "already current with upstream; no build needed"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            # This repository carries its own commit (this workflow), so upstream is
+            # merged rather than fast-forwarded. A conflict fails the step loudly.
+            git -c user.name="github-actions[bot]" \
+                -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+                merge --no-edit "$UPSTREAM"
+            git push origin HEAD:master
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "upstream merged into master"
           fi
-
-          MERGE_TYPE=$(printf '%s' "$RESPONSE" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("merge_type", "none"))')
-          echo "merge_type=$MERGE_TYPE"
-          echo "head=$(gh api "repos/$GITHUB_REPOSITORY/commits/master" --jq .sha)" >> "$GITHUB_OUTPUT"
-          echo "upstream=$(gh api "repos/$UPSTREAM_REPOSITORY/commits/master" --jq '.sha[0:7]')" >> "$GITHUB_OUTPUT"
-          case "$MERGE_TYPE" in
-            fast-forward|merge)
-              echo "changed=true" >> "$GITHUB_OUTPUT"
-              echo "upstream moved; the fork now has it"
-              ;;
-            none)
-              echo "changed=false" >> "$GITHUB_OUTPUT"
-              echo "the fork already matches upstream; no build needed"
-              ;;
-            *)
-              echo "::warning::unexpected merge_type $MERGE_TYPE"
-              echo "changed=false" >> "$GITHUB_OUTPUT"
-              ;;
-          esac
+          echo "head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
   build:
     name: Build macOS Intel (x86_64)
