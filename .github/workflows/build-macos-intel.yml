@@ -1,0 +1,458 @@
+# Keep this fork's master in step with deepseek-ai/deepseek-harness and build a
+# macOS Intel (x86_64) desktop app whenever upstream moves.
+#
+# Two jobs:
+#   sync   - asks GitHub to fast-forward or merge the fork from upstream master,
+#            and reports whether anything changed.
+#   build  - runs only when something changed (or when forced), on the standard
+#            Intel runner, using upstream's own unsigned macOS path
+#            (`package:mac:x64:unsigned`: ad-hoc signing, no certificate, no
+#            notarization, no .env.macos).
+#
+# Every successful build publishes (or updates) the GitHub Release for that version,
+# so the nightly run needs no manual step: the zip, the dmg and the instructions are
+# attached to the tag dsh-macos-x64-<version>.
+#
+# This repository is an ordinary repository, not a fork: GitHub disables scheduled
+# workflows in forks ("When a public repository is forked, scheduled workflows are
+# disabled by default"), so a fork cannot run this on a timetable.
+#
+# The sync job runs in the same workflow as the build on purpose: a push made with
+# the workflow's own GITHUB_TOKEN does not start other workflow runs, so a separate
+# "build on push" workflow would never fire.
+#
+# The app is ad-hoc signed, which Gatekeeper rejects for a quarantined download.
+# Recipients clear the attribute once:
+#   xattr -dr com.apple.quarantine "/Applications/DeepSeek Harness.app"
+
+name: Build macOS Intel (x86_64)
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild even when the fork already matches upstream
+        type: boolean
+        default: false
+  schedule:
+    # 02:17 Beijing (18:17 UTC), off the hour because scheduled runs queue up then.
+    - cron: '17 18 * * *'
+
+# The sync job merges upstream into master, and a release needs write access.
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_REPOSITORY: deepseek-ai/deepseek-harness
+  DSH_TELEMETRY_DISABLED: '1'
+
+concurrency:
+  group: build-macos-intel
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync with upstream
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      changed: ${{ steps.sync.outputs.changed }}
+      head: ${{ steps.sync.outputs.head }}
+      upstream: ${{ steps.sync.outputs.upstream }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: master
+
+      # This repository holds upstream's tree plus this workflow, nothing else. Each
+      # sync replaces the tree with a snapshot instead of merging, so upstream's own
+      # .github directory (its workflows and Dependabot config) never lands here and
+      # no merge conflict can ever arise.
+      - name: Replace the tree with upstream's snapshot
+        id: sync
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          UPSTREAM_SHA=$(gh api "repos/$UPSTREAM_REPOSITORY/commits/master" --jq .sha)
+          printf 'upstream=%.7s\n' "$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
+          RECORDED=$(cat .dsh-upstream-sha 2>/dev/null || true)
+          if [ "$UPSTREAM_SHA" = "$RECORDED" ]; then
+            echo "already at $(printf %.7s "$UPSTREAM_SHA"); no build needed"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          curl -sSL --retry 3 --max-time 900 \
+            "https://codeload.github.com/$UPSTREAM_REPOSITORY/tar.gz/$UPSTREAM_SHA" \
+            -o /tmp/upstream.tar.gz
+          mkdir -p /tmp/upstream && tar -xzf /tmp/upstream.tar.gz -C /tmp/upstream --strip-components=1
+          rsync -a --delete --exclude '.git' --exclude '.github' /tmp/upstream/ ./
+          printf '%s\n' "$UPSTREAM_SHA" > .dsh-upstream-sha
+
+          git add -A
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -q -m "Sync to upstream $(printf %.7s "$UPSTREAM_SHA")"
+          git push origin HEAD:master
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "tree replaced with upstream $(printf %.7s "$UPSTREAM_SHA")"
+
+      - name: Keep only this workflow enabled
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Leftovers from before the snapshot design; the tree no longer ships them.
+          for ID in $(gh api "repos/$GITHUB_REPOSITORY/actions/workflows?per_page=100" \
+                        --jq '.workflows[] | select(.name != "Build macOS Intel (x86_64)") | .id'); do
+            gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/$ID/disable" >/dev/null \
+              && echo "disabled workflow $ID"
+          done
+
+  build:
+    name: Build macOS Intel (x86_64)
+    needs: sync
+    if: ${{ needs.sync.outputs.changed == 'true' || inputs.force }}
+    runs-on: macos-15-intel
+    timeout-minutes: 240
+    outputs:
+      version: ${{ steps.publish.outputs.version }}
+      release: ${{ steps.publish.outputs.release }}
+    env:
+      TARGET_DIR: apps/desktop/.desktop-build/targets/mac-x64
+      APP_PATH: apps/desktop/.desktop-build/targets/mac-x64/unsigned-artifacts/mac/DeepSeek Harness.app
+      # Running the bundled Python inside the signed bundle would write __pycache__
+      # into it and invalidate the seal; never let it.
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Report runner
+        run: |
+          sw_vers
+          uname -m
+          df -h /
+
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: master
+          persist-credentials: false
+
+      - name: Refresh to the branch head the sync job produced
+        run: |
+          # A scheduled run carries the branch tip from before the sync job merged
+          # upstream, so check out the current head explicitly.
+          git fetch --depth 1 origin master
+          git checkout --detach FETCH_HEAD
+          echo "building $(git rev-parse --short HEAD): $(git log -1 --format=%s)"
+          if [ "$(git rev-parse HEAD)" != "${{ needs.sync.outputs.head }}" ]; then
+            echo "::warning::checked out a different commit than the sync job reported"
+          fi
+          node -p "'desktop version ' + require('./apps/desktop/package.json').version"
+
+      - name: Free disk space
+        run: |
+          # A standard macOS runner advertises 14 GB of usable SSD and this build needs
+          # roughly 10 GB, so reclaim the simulator runtimes and caches it never uses.
+          sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes/* 2>/dev/null || true
+          sudo rm -rf /Library/Developer/CoreSimulator/Caches/* 2>/dev/null || true
+          rm -rf ~/Library/Developer/CoreSimulator/Caches/* 2>/dev/null || true
+          rm -rf ~/Library/Caches/Homebrew ~/Library/Developer/Xcode/DerivedData 2>/dev/null || true
+          df -h /
+
+      - uses: pnpm/action-setup@v5.0.0
+
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Install workspace dependencies
+        timeout-minutes: 60
+        run: pnpm install --frozen-lockfile
+
+      # The unsigned path takes no release settings, so it needs no dotenv file and no
+      # signing material. It ad-hoc signs the bundle, skips notarization, and runs the
+      # packaged-runtime smoke test against the finished application.
+      - name: Package mac-x64 (unsigned)
+        timeout-minutes: 180
+        run: |
+          # The packaged-runtime smoke converts real Office documents through LibreOffice.
+          # That normally takes 11-41 s but occasionally exceeds its 60 s conversion timeout
+          # on a loaded runner, so one retry keeps a slow runner from failing an otherwise
+          # good nightly build. Two clean failures still fail the job.
+          for ATTEMPT in 1 2; do
+            echo "::group::packaging attempt $ATTEMPT"
+            if pnpm run package:desktop:mac:x64:unsigned; then
+              echo "::endgroup::"
+              echo "packaging succeeded on attempt $ATTEMPT"
+              exit 0
+            fi
+            echo "::endgroup::"
+            echo "::warning::packaging attempt $ATTEMPT failed"
+            sleep 10
+          done
+          echo "::error::packaging failed on both attempts"
+          exit 1
+
+      - name: Verify the bundle
+        run: |
+          if [ ! -d "$APP_PATH" ]; then
+            echo "::error::no application bundle was produced"
+            exit 1
+          fi
+
+          # These are exactly the properties that decide whether the archive works on
+          # somebody else's Mac.
+          if ! file "$APP_PATH/Contents/MacOS/DeepSeek Harness" | grep -q x86_64; then
+            echo "::error::the main binary is not x86_64"
+            exit 1
+          fi
+          codesign --verify --deep --strict "$APP_PATH"
+          codesign -dv --verbose=4 "$APP_PATH" 2>&1 | grep -E '^(Identifier|Format|Signature|TeamIdentifier)' || true
+
+          # The decisive test: both bundled interpreters must actually start under this
+          # signature, which is what fails when a bundle's code signing is wrong.
+          "$APP_PATH/Contents/Resources/runtime/primary-runtime/dependencies/node/bin/node" -e \
+            "console.log('bundled node', process.version, process.arch)"
+          "$APP_PATH/Contents/Resources/runtime/primary-runtime/dependencies/python/bin/python3" -c \
+            "import sys; print('bundled python', sys.version.split()[0])"
+
+          if xattr -p com.apple.quarantine "$APP_PATH" >/dev/null 2>&1; then
+            echo "::error::the built app carries a quarantine attribute"
+            exit 1
+          fi
+          echo "arch, signature and bundled runtime: ok"
+
+      - name: Clean interpreter residue and verify the shipped signature
+        run: |
+          # The packaged-runtime smoke runs the bundled Python inside the app bundle, and
+          # Python writes __pycache__ next to the modules it imports. Those files appear
+          # after signing and are not part of the seal, so an archive that contains them
+          # fails codesign --verify for whoever unpacks it. Drop them, then prove the
+          # bundle that actually ships still verifies.
+          find "$APP_PATH" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
+          find "$APP_PATH" -name '*.pyc' -delete 2>/dev/null || true
+          if find "$APP_PATH" -name '*.pyc' | grep -q .; then
+            echo "::error::interpreter residue survived the cleanup"
+            exit 1
+          fi
+          codesign --verify --deep --strict "$APP_PATH"
+          echo "the bundle that ships verifies"
+
+      - name: Create the distributable archives
+        run: |
+          VERSION=$(node -p "require('./apps/desktop/package.json').version")
+          # Upstream's commit, not this repository's sync commit, identifies the build.
+          SHA=$(cut -c1-7 .dsh-upstream-sha 2>/dev/null || git rev-parse --short HEAD)
+          NAME="deepseek-harness-${VERSION}-${SHA}-macos-x64"
+          mkdir -p dist
+
+          # electron-builder already produced a DMG (with the Applications symlink);
+          # give it this workflow's naming, then add a ditto-made zip beside it.
+          DMG=$(ls "$TARGET_DIR"/unsigned-artifacts/*.dmg | head -1)
+          cp "$DMG" "dist/${NAME}.dmg"
+          ditto -c -k --keepParent "$APP_PATH" "dist/${NAME}.zip"
+
+          # The DMG is the primary download, so verify the bundle a recipient mounts.
+          MP=$(hdiutil attach -nobrowse -readonly "dist/${NAME}.dmg" | awk -F'\t' '/\/Volumes\//{print $NF; exit}')
+          if [ -z "$MP" ]; then
+            echo "::error::the dmg did not mount"
+            exit 1
+          fi
+          codesign --verify --deep --strict "$MP/DeepSeek Harness.app"
+          echo "dmg bundle verifies: CDHash $(codesign -dv --verbose=4 "$MP/DeepSeek Harness.app" 2>&1 | sed -n 's/^CDHash=//p')"
+          hdiutil detach "$MP" >/dev/null
+
+          # Verify the ZIP the way a recipient experiences it: extract it fresh and check
+          # the bundle inside. A signature that only survives until the archive is written
+          # is exactly the defect this catches.
+          CHECK=$(mktemp -d)
+          ditto -x -k "dist/${NAME}.zip" "$CHECK"
+          if find "$CHECK/DeepSeek Harness.app" -name '*.pyc' | grep -q .; then
+            echo "::error::the zip contains Python bytecode residue"
+            exit 1
+          fi
+          codesign --verify --deep --strict "$CHECK/DeepSeek Harness.app"
+          rm -rf "$CHECK"
+          echo "zip verified after extraction"
+
+          ZIPSHA=$(shasum -a 256 "dist/${NAME}.zip" | awk '{print $1}')
+          DMGSHA=$(shasum -a 256 "dist/${NAME}.dmg" | awk '{print $1}')
+          ( cd dist && shasum -a 256 *.zip *.dmg > SHA256SUMS.txt )
+
+          cat > dist/使用说明.txt <<EOF
+          DeepSeek Harness 桌面端 — macOS Intel (x86_64) 内部构建
+          =========================================================
+
+          版本     ${VERSION}
+          提交     ${SHA}
+          架构     x86_64（Intel 原生）
+          系统要求 macOS 13.0 (Ventura) 或更高
+
+          上游：https://github.com/deepseek-ai/deepseek-harness  （MIT）
+          这是内部构建，非官方发布产物，没有 Apple 开发者签名也没有公证。
+
+          安装
+          ----
+          dmg：双击挂载 → 把 "DeepSeek Harness.app" 拖到 Applications → 推出磁盘映像。
+          zip：解压后把 app 拖到 Applications。
+              解压请用 Finder 或 ditto -x -k，不要用 unzip（会丢掉 bundle 的符号链接和权限位）。
+
+          打不开怎么办
+          ------------
+          只要是用浏览器下载的（包括从 GitHub 网页直接下载），macOS 都会打上 quarantine
+          标记，首次打开会被 Gatekeeper 拦下。内网共享 / U 盘 / scp 传过去的文件没有这个
+          标记，双击即可打开。
+          需要清掉时执行一次：
+
+              xattr -dr com.apple.quarantine "/Applications/DeepSeek Harness.app"
+
+          想省掉这一步，可以用命令行下载（curl 不写这个标记）：
+
+              curl -L -o dsh.dmg "<Release 里 dmg 的下载链接>"
+              open dsh.dmg
+
+          请不要用 sudo spctl --master-disable 关掉全局 Gatekeeper。
+
+          Apple Silicon（M 系列）
+          ----------------------
+          这是 Intel x86_64 构建，需要先装 Rosetta 2：softwareupdate --install-rosetta
+
+          已知限制
+          --------
+          1. 检查更新会失败：内部构建不带更新源，不会自动更新。升级请换用新的包。
+          2. 账号登录未接通（上游 developer preview 状态），请在设置里填 DeepSeek API Key。
+          3. 与 CLI 版共享 ~/.dsh 下的会话和设置。
+          4. developer preview，profile 数据不保证跨版本兼容。
+
+          完整性校验
+          ----------
+          SHA-256:
+
+            ${ZIPSHA}
+                ${NAME}.zip
+
+            ${DMGSHA}
+                ${NAME}.dmg
+
+          校验命令：shasum -a 256 <文件名>
+
+          自包含说明
+          ----------
+          app 内已带完整运行时，目标机器无需预装 Node.js 或 Python。
+          安装后不依赖任何构建目录，可随意移动。
+          EOF
+
+          # GitHub replaces a non-ASCII release-asset name with "default.txt", so the
+          # release uploads this ASCII copy while the artifact keeps the Chinese name.
+          cp dist/使用说明.txt README-zh-CN.txt
+
+          ls -lh dist/
+          echo "NAME=${NAME}" >> "$GITHUB_ENV"
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          echo "ZIPSHA=${ZIPSHA}" >> "$GITHUB_ENV"
+          echo "DMGSHA=${DMGSHA}" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: deepseek-harness-macos-x64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish the GitHub Release
+        id: publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="dsh-macos-x64-${VERSION}"
+
+          # Alpha/beta/rc builds are marked as prereleases so GitHub keeps the newest
+          # stable release as "latest" instead of pointing it at an internal build.
+          PRERELEASE=""
+          case "$VERSION" in
+            *-*) PRERELEASE="--prerelease" ;;
+          esac
+
+          cat > release-notes.md <<EOF
+          内部构建（ad-hoc 签名，未公证），macOS Intel (x86_64)，版本 ${VERSION}。
+
+          **安装**：下载 dmg → 拖入 Applications。
+
+          **首次打开**：只要是用浏览器下载的（从 GitHub 网页直接下载也一样），macOS 都会加上 quarantine 标记，首次打开会被拦下。执行一次即可：
+
+              xattr -dr com.apple.quarantine "/Applications/DeepSeek Harness.app"
+
+          | 文件 | SHA-256 |
+          |---|---|
+          | ${NAME}.zip | ${ZIPSHA} |
+          | ${NAME}.dmg | ${DMGSHA} |
+
+          其余说明见附件 README-zh-CN.txt（使用说明）。
+          EOF
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "DeepSeek Harness macOS Intel ${VERSION}" --notes-file release-notes.md
+          else
+            gh release create "$TAG" --title "DeepSeek Harness macOS Intel ${VERSION}" \
+              --notes-file release-notes.md $PRERELEASE
+          fi
+          gh release upload "$TAG" \
+            "dist/${NAME}.zip" "dist/${NAME}.dmg" README-zh-CN.txt "dist/SHA256SUMS.txt" \
+            --clobber
+
+          # The dmg and zip names carry the built commit, so rebuilding a version adds a
+          # second pair instead of replacing the first. Keep only this build's files.
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq '.assets[] | "\(.id) \(.name)"' \
+            | while read -r ID NAME_ON_RELEASE; do
+                case "$NAME_ON_RELEASE" in
+                  "${NAME}.zip"|"${NAME}.dmg"|README-zh-CN.txt|SHA256SUMS.txt) ;;
+                  *) echo "removing stale asset $NAME_ON_RELEASE"
+                     gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$ID" >/dev/null ;;
+                esac
+              done
+          echo "release published: $(gh release view "$TAG" --json url --jq .url)"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "release=$(gh release view "$TAG" --json url --jq .url)" >> "$GITHUB_OUTPUT"
+
+  notify:
+    name: Notify Feishu
+    needs: [sync, build]
+    # Runs even when the build was skipped or failed, because silence is the problem.
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Send the result to the Feishu bot
+        env:
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+          SYNC_RESULT: ${{ needs.sync.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          UPSTREAM_SHA: ${{ needs.sync.outputs.upstream }}
+          BUILT_VERSION: ${{ needs.build.outputs.version }}
+          RELEASE_URL: ${{ needs.build.outputs.release }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # A fork without the secret keeps working; the notification is not a build step.
+          if [ -z "${FEISHU_WEBHOOK:-}" ]; then
+            echo "::warning::FEISHU_WEBHOOK is not set; skipping the notification"
+            exit 0
+          fi
+
+          STAMP=$(TZ=Asia/Shanghai date "+%Y-%m-%d %H:%M")
+          if [ "$SYNC_RESULT" != "success" ]; then
+            TEXT=$(printf "%s\n" "❌ DeepSeek Harness macOS Intel：同步上游失败" "请查看日志：$RUN_URL")
+          elif [ "$BUILD_RESULT" = "skipped" ]; then
+            TEXT=$(printf "%s\n" "✅ DeepSeek Harness macOS Intel：上游无更新，本次未构建" "上游提交：$UPSTREAM_SHA" "时间：$STAMP")
+          elif [ "$BUILD_RESULT" = "success" ]; then
+            TEXT=$(printf "%s\n" "🚀 DeepSeek Harness macOS Intel 新版本已发布" "版本：${BUILT_VERSION:-未知}" "Release：${RELEASE_URL:-https://github.com/$GITHUB_REPOSITORY/releases}" "时间：$STAMP")
+          else
+            TEXT=$(printf "%s\n" "❌ DeepSeek Harness macOS Intel：构建失败（$BUILD_RESULT）" "日志：$RUN_URL" "时间：$STAMP")
+          fi
+
+          PAYLOAD=$(jq -n --arg text "$TEXT" '{msg_type:"text",content:{text:$text}}')
+          RESPONSE=$(curl -sS --max-time 20 -X POST "$FEISHU_WEBHOOK" -H "Content-Type: application/json" -d "$PAYLOAD" 2>&1) || true
+          echo "feishu response: $RESPONSE"
+          printf "%s" "$RESPONSE" | jq -e ".code == 0 or .StatusCode == 0" >/dev/null \
+            || echo "::warning::the Feishu bot did not accept the message"
